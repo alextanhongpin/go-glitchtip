@@ -12,3 +12,7 @@ up:
 
 down:
 	@docker-compose down
+
+
+open:
+	@open http://localhost:8000

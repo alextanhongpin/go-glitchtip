@@ -1,8 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -16,15 +17,6 @@ import (
 	sentryhttp "github.com/getsentry/sentry-go/http"
 	"golang.org/x/exp/slog"
 )
-
-type BadRequestError struct {
-}
-
-func (e *BadRequestError) Error() string {
-	return "bad request"
-}
-
-var ErrBadRequest = errors.New("bad request")
 
 func main() {
 	err := sentry.Init(sentry.ClientOptions{
@@ -44,39 +36,28 @@ func main() {
 	// Set the timeout to the maximum duration the program can afford to wait.
 	defer sentry.Flush(2 * time.Second)
 
-	sentry.CaptureException(usecase(context.Background()))
-	sentry.CaptureMessage("It works!")
-
 	// Create an instance of sentryhttp
 	sentryHandler := sentryhttp.New(sentryhttp.Options{})
 
 	mux := http.NewServeMux()
-	mux.Handle("/", sentryHandler.HandleFunc(handler))
+	mux.Handle("/usecase", sentryHandler.HandleFunc(usecaseHandler))
+	mux.Handle("/message", sentryHandler.HandleFunc(messageHandler))
+
 	l := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	server.New(l, mux, 8080)
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	if hub := sentry.GetHubFromContext(r.Context()); hub != nil {
-		hub.WithScope(func(scope *sentry.Scope) {
-			scope.SetExtra("unwantedQuery", "someQueryDataMaybe")
-			b, err := io.ReadAll(r.Body)
-			if err != nil {
-				hub.CaptureException(err)
-			} else {
-				scope.SetExtra("body", string(b))
-				hub.CaptureMessage("User provided unwanted query string, but we recovered just fine")
-			}
-		})
-	}
-	fmt.Fprint(w, "hello world")
+func messageHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	captureMessage(ctx, "This happened")
+	fmt.Fprint(w, "ok")
 }
 
-func usecase(ctx context.Context) error {
-	span := sentry.StartSpan(ctx, "operation")
-	defer span.Finish()
+func usecaseHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
-	sentry.ConfigureScope(func(scope *sentry.Scope) {
+	sentryScope(ctx, func(scope *sentry.Scope) {
+		scope.SetTag("page.locale", "de-at")
 		scope.SetUser(sentry.User{
 			ID:        "usser-1234",
 			Email:     "john.doe@mail.com",
@@ -89,18 +70,68 @@ func usecase(ctx context.Context) error {
 				"Verified": "true",
 			},
 		})
-		scope.SetTag("page.locale", "de-at")
+
+		for k, v := range r.Header {
+			scope.SetExtra(k, v[0])
+		}
+
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			panic(err)
+		}
+		bb := new(bytes.Buffer)
+		if err := json.Indent(bb, b, "", " "); err != nil {
+			panic(err)
+		}
+
+		if body := bb.Bytes(); len(body) != 0 {
+			scope.SetExtra("body-str", string(body))
+			scope.SetExtra("body-byt", body)
+		}
+
 		scope.AddBreadcrumb(&sentry.Breadcrumb{
-			Category: "foo",
-			Message:  "foo",
-			Level:    sentry.LevelInfo,
+			Type:     "Controller",
+			Category: "controller",
+			Message:  "Enter controller",
+			Data: map[string]interface{}{
+				"controllerName": "SomeController",
+			},
+			Level:     sentry.LevelInfo,
+			Timestamp: time.Now(),
 		}, 10)
+	})
+
+	if err := usecase(ctx, usecaseDto{
+		Name: "john",
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		captureException(ctx, err)
+		return
+	}
+
+	fmt.Fprint(w, "hello world")
+}
+
+type usecaseDto struct {
+	Name string
+}
+
+func usecase(ctx context.Context, dto usecaseDto) error {
+	span := sentry.StartSpan(ctx, "operation")
+	defer span.Finish()
+
+	sentryScope(ctx, func(scope *sentry.Scope) {
 		scope.AddBreadcrumb(&sentry.Breadcrumb{
-			Category: "bar",
-			Message:  "bar",
+			Type:     "Usecase",
+			Category: "usecase",
+			Message:  "Entering usecase",
 			Level:    sentry.LevelInfo,
+			Data: map[string]interface{}{
+				"req": dto,
+			},
+			Timestamp: time.Now(),
 		}, 10)
-		scope.SetExtra("what", "is extra")
+		scope.SetExtra("what", dto) // This is recommended
 		scope.SetExtra("json", `{"name": "john"}`)
 	})
 
@@ -112,11 +143,34 @@ func foo() error {
 	if err != nil {
 		return fmt.Errorf("foo: %w", err)
 	}
+
 	return nil
 }
 
 func bar() error {
-	//return ErrBadRequest
-	//return &BadRequestError{}
 	return errcodes.New(errcodes.BadRequest, "bar_bad_request", "Don't user bar please")
+}
+
+func captureMessage(ctx context.Context, msg string) {
+	if !sentry.HasHubOnContext(ctx) || msg == "" {
+		return
+	}
+
+	sentry.GetHubFromContext(ctx).CaptureMessage(msg)
+}
+
+func captureException(ctx context.Context, err error) {
+	if !sentry.HasHubOnContext(ctx) || err == nil {
+		return
+	}
+
+	sentry.GetHubFromContext(ctx).CaptureException(err)
+}
+
+func sentryScope(ctx context.Context, fn func(scope *sentry.Scope)) {
+	if !sentry.HasHubOnContext(ctx) {
+		return
+	}
+
+	fn(sentry.GetHubFromContext(ctx).Scope())
 }
