@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,8 +14,10 @@ import (
 
 	"github.com/alextanhongpin/core/http/server"
 	"github.com/alextanhongpin/errcodes"
+	"github.com/alextanhongpin/errcodes/stacktrace"
 	"github.com/getsentry/sentry-go"
 	sentryhttp "github.com/getsentry/sentry-go/http"
+	"go.jetpack.io/typeid"
 	"golang.org/x/exp/slog"
 )
 
@@ -42,6 +45,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/usecase", sentryHandler.HandleFunc(usecaseHandler))
 	mux.Handle("/message", sentryHandler.HandleFunc(messageHandler))
+	mux.Handle("/error", sentryHandler.HandleFunc(errorHandler))
 
 	l := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	server.New(l, mux, 8080)
@@ -49,8 +53,86 @@ func main() {
 
 func messageHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	captureMessage(ctx, "This happened")
+	if hub := sentry.GetHubFromContext(ctx); hub != nil {
+		hub.CaptureMessage("This happened")
+	}
+
 	fmt.Fprint(w, "ok")
+}
+
+func errorHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	span := sentry.TransactionFromContext(ctx)
+	defer span.Finish()
+	span.SetData("span-data-key", "span-data-val")
+	span.SetTag("span-tag-key", "span-tag-val")
+
+	hub := sentry.GetHubFromContext(ctx)
+	if hub != nil {
+		scope := hub.Scope()
+		tid := typeid.Must(typeid.New("user"))
+
+		// https://develop.sentry.dev/sdk/event-payloads/breadcrumbs/#breadcrumb-types
+		scope.AddBreadcrumb(&sentry.Breadcrumb{
+			Type:     "debug",
+			Category: "error.handle",
+			Data: map[string]any{
+				"hello": struct {
+					ID   string
+					Name string
+				}{
+					ID:   tid.String(),
+					Name: "john",
+				},
+			},
+			Level:     sentry.LevelDebug,
+			Message:   "some message",
+			Timestamp: time.Now(),
+		}, 100)
+
+		scope.SetExtra("key", "value")
+		scope.SetExtra("foo", struct {
+			Name string
+		}{
+			Name: "john",
+		})
+	}
+
+	err := two(ctx)
+	if err != nil {
+		hub.CaptureException(stacktrace.Flatten(err))
+	}
+
+	fmt.Fprint(w, http.StatusText(http.StatusInternalServerError))
+}
+
+func one() error {
+	return stacktrace.New(errors.New("one"))
+}
+
+func two(ctx context.Context) error {
+	err := stacktrace.Wrap(one(), "two")
+	if err != nil {
+		if hub := sentry.GetHubFromContext(ctx); hub != nil {
+			scope := hub.Scope()
+			scope.SetTag("two-key", "two-val")
+
+			scope.AddBreadcrumb(&sentry.Breadcrumb{
+				Type:     "debug",
+				Category: "two.handle",
+				Data: map[string]any{
+					"req": 1,
+				},
+				Level:     sentry.LevelDebug,
+				Message:   "called two failed",
+				Timestamp: time.Now(),
+			}, 100)
+		}
+
+		return err
+	}
+
+	return nil
 }
 
 func usecaseHandler(w http.ResponseWriter, r *http.Request) {
@@ -141,7 +223,7 @@ func usecase(ctx context.Context, dto usecaseDto) error {
 func foo() error {
 	err := bar()
 	if err != nil {
-		return fmt.Errorf("foo: %w", err)
+		return stacktrace.Wrap(fmt.Errorf("foo: %w", err), "foo")
 	}
 
 	return nil
@@ -159,6 +241,7 @@ func captureMessage(ctx context.Context, msg string) {
 	sentry.GetHubFromContext(ctx).CaptureMessage(msg)
 }
 
+// Don't do this, cause the stacktrace will be added at this point, which is redundant.
 func captureException(ctx context.Context, err error) {
 	if !sentry.HasHubOnContext(ctx) || err == nil {
 		return
