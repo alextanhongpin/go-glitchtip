@@ -49,3 +49,9 @@ Span can panic if nil.
 	}
 	defer span.Finish()
 ```
+
+
+## No duplicate stacktrace
+
+![Stack Trace](/assets/01_stack.png)
+![Unwrapped errors](/assets/02_stack.png)

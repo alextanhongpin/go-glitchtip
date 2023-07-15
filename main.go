@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,13 +12,17 @@ import (
 	"time"
 
 	"github.com/alextanhongpin/core/http/server"
-	"github.com/alextanhongpin/errcodes"
-	"github.com/alextanhongpin/errcodes/stacktrace"
+	"github.com/alextanhongpin/errors/causes"
+	"github.com/alextanhongpin/errors/codes"
+	"github.com/alextanhongpin/errors/stacktrace"
 	"github.com/getsentry/sentry-go"
 	sentryhttp "github.com/getsentry/sentry-go/http"
 	"go.jetpack.io/typeid"
-	"golang.org/x/exp/slog"
 )
+
+func init() {
+	stacktrace.SetMaxDepth(8)
+}
 
 func main() {
 	err := sentry.Init(sentry.ClientOptions{
@@ -47,8 +50,7 @@ func main() {
 	mux.Handle("/message", sentryHandler.HandleFunc(messageHandler))
 	mux.Handle("/error", sentryHandler.HandleFunc(errorHandler))
 
-	l := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	server.New(l, mux, 8080)
+	server.ListenAndServe(":8080", mux)
 }
 
 func messageHandler(w http.ResponseWriter, r *http.Request) {
@@ -98,20 +100,33 @@ func errorHandler(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	err := two(ctx)
+	err := six(ctx)
 	if err != nil {
-		hub.CaptureException(stacktrace.Flatten(err))
+		hub.CaptureException(err)
 	}
 
 	fmt.Fprint(w, http.StatusText(http.StatusInternalServerError))
 }
 
+type stackTrace struct {
+	msg   string
+	stack []uintptr
+}
+
+func (s *stackTrace) Error() string {
+	return s.msg
+}
+
+func (s *stackTrace) StackTrace() []uintptr {
+	return s.stack
+}
+
 func one() error {
-	return stacktrace.New(errors.New("one"))
+	return stacktrace.New("one")
 }
 
 func two(ctx context.Context) error {
-	err := stacktrace.Wrap(one(), "two")
+	err := stacktrace.Annotate(one(), "two")
 	if err != nil {
 		if hub := sentry.GetHubFromContext(ctx); hub != nil {
 			scope := hub.Scope()
@@ -133,6 +148,22 @@ func two(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func three(ctx context.Context) error {
+	return stacktrace.Annotate(two(ctx), "three")
+}
+
+func four(ctx context.Context) error {
+	return stacktrace.Annotate(three(ctx), "four")
+}
+
+func five(ctx context.Context) error {
+	return stacktrace.Annotate(four(ctx), "five")
+}
+
+func six(ctx context.Context) error {
+	return stacktrace.Annotate(five(ctx), "six")
 }
 
 func usecaseHandler(w http.ResponseWriter, r *http.Request) {
@@ -223,14 +254,14 @@ func usecase(ctx context.Context, dto usecaseDto) error {
 func foo() error {
 	err := bar()
 	if err != nil {
-		return stacktrace.Wrap(fmt.Errorf("foo: %w", err), "foo")
+		return stacktrace.Annotate(fmt.Errorf("foo: %w", err), "foo")
 	}
 
 	return nil
 }
 
 func bar() error {
-	return errcodes.New(errcodes.BadRequest, "bar_bad_request", "Don't user bar please")
+	return causes.New(codes.BadRequest, "bar_bad_request", "Don't user bar please")
 }
 
 func captureMessage(ctx context.Context, msg string) {
